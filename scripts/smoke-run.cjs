@@ -9,6 +9,7 @@ const server = path.join(__dirname, "..", "server", "zcode-worker.cjs");
 const workspace = path.resolve(process.argv[2] || path.join(__dirname, ".."));
 const model = process.argv[3] || "GLM-High";
 const resumeSessionId = process.argv[4];
+const task = process.argv.slice(5).join(" ") || "Reply with exactly OK. Do not use tools or modify files.";
 const child = spawn(nodeExe, [server], { stdio: ["pipe", "pipe", "inherit"], windowsHide: true });
 let nextId = 1;
 let buffer = "";
@@ -44,7 +45,7 @@ async function main() {
   await request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "smoke-run", version: "1" } });
   child.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n');
   const toolName = resumeSessionId ? "continue_task" : "run_task";
-  const toolArgs = { workspace, task: "Reply with exactly OK. Do not use tools or modify files.", model, mode: "plan" };
+  const toolArgs = { workspace, task, model, mode: "plan" };
   if (resumeSessionId) toolArgs.session_id = resumeSessionId;
   const started = await request("tools/call", { name: toolName, arguments: toolArgs });
   const jobId = JSON.parse(started.content[0].text).job_id;

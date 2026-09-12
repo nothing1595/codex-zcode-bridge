@@ -45,6 +45,17 @@ Concurrency limit: `ZCODE_MAX_PARALLEL_JOBS` (default **2**). Extra jobs queue a
 
 **Scheduling rule for the main Codex agent:** parallel GLM workers are best for search, analysis, different modules, different files, and independent experiments. Do not let two parallel workers modify the same file — serialize those or isolate them with `git worktree`. If a job fails with `unknown_error (UNKNOWN_ERROR)` and no output, another ZCode turn was likely active at the same moment (plan concurrency cap or manual use of the ZCode app); retry the same task once after another GLM job finishes.
 
+## Session continuity
+
+`continue_task` resumes a ZCode session with conversation-level context intact. The agent instructions pin one long-lived ZCode session per Codex worker conversation: the first task uses `run_task`, and every follow-up in the same conversation uses `continue_task` with the session_id reported by `get_status`.
+
+Two behaviors verified against ZCode Desktop:
+
+- A follow-up either appends to the same session or forks a linked follow-up task; both carry the previous conversation (the fork's first request tokens equal the prior turn's input + output). The bridge returns whichever session actually received the prompt, so further continues chain correctly.
+- The turn_usage completion signal must be attributed to the *current* turn: a continued session still has its previous turns' `completed` rows, which would otherwise read as instant completion with empty output. `readSession` only trusts a usage row that started at/just before the last user message.
+
+Note: the delegated subagent inside ZCode always starts fresh by design; the ZCode main agent's summary is what carries across turns.
+
 ## Cancellation and captcha
 
 - `cancel_task` is safe at any phase. Before send, the job aborts immediately. After send, the broker first hunts down the session id and stops the ZCode session through the UI (so no orphan session keeps burning tokens), then finalizes the job as `cancelled`.

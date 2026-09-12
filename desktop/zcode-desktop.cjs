@@ -177,7 +177,13 @@ function readSession(sessionId) {
       .map((row) => ({ ...row, parsed: parseJson(row.data) }));
     const parts = db.prepare("SELECT * FROM part WHERE session_id = ? ORDER BY sequence, time_created").all(sessionId)
       .map((row) => ({ ...row, parsed: parseJson(row.data) }));
-    const usage = db.prepare("SELECT * FROM turn_usage WHERE session_id = ? ORDER BY started_at DESC LIMIT 1").get(sessionId) || null;
+    // A continued session still carries its PREVIOUS turns' turn_usage rows;
+    // the latest row says "completed" while the current turn is streaming.
+    // Only a row belonging to the current turn (started at/just before the
+    // last user message) is a valid completion signal.
+    const usageRow = db.prepare("SELECT * FROM turn_usage WHERE session_id = ? ORDER BY started_at DESC LIMIT 1").get(sessionId) || null;
+    const lastUserTime = Math.max(0, ...messages.filter((m) => m.parsed.role === "user").map((m) => Number(m.time_created || 0)));
+    const usage = usageRow && Number(usageRow.started_at) >= lastUserTime - 5_000 ? usageRow : null;
     const latestUserSequence = Math.max(-1, ...messages.filter((m) => m.parsed.role === "user").map((m) => Number(m.sequence ?? -1)));
     const currentAssistants = messages.filter((m) => m.parsed.role === "assistant" && Number(m.sequence ?? -1) > latestUserSequence);
     const finalMessages = currentAssistants.filter((m) => m.parsed.finish && m.parsed.finish !== "tool-calls");
