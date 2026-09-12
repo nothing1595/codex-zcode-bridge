@@ -13,11 +13,23 @@ const ZCODE_DB = process.env.ZCODE_DB || path.join(os.homedir(), ".zcode", "cli"
 const POLL_MS = Number(process.env.ZCODE_POLL_MS || 750);
 const START_TIMEOUT_MS = Number(process.env.ZCODE_START_TIMEOUT_MS || 30_000);
 const TASK_TIMEOUT_MS = Number(process.env.ZCODE_TASK_TIMEOUT_MS || 30 * 60_000);
+// Upper bound for hunting the session id after Send was clicked while a cancel came in.
+const CANCEL_HUNT_TIMEOUT_MS = Number(process.env.ZCODE_CANCEL_HUNT_TIMEOUT_MS || 60_000);
+
+// turn_usage rows are only written when a turn ends. Only these statuses are
+// interpreted; anything else (present or future) keeps the watcher waiting.
+const USAGE_SUCCESS = new Set(["completed", "success"]);
+const USAGE_FAILED = new Set(["error"]);
+const USAGE_CANCELLED = new Set(["cancelled"]);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function cancelledError(message = "ZCode task was cancelled") {
+  return Object.assign(new Error(message), { code: "CANCELLED" });
+}
+
 function throwIfAborted(signal) {
-  if (signal?.aborted) throw Object.assign(new Error("ZCode task was cancelled"), { code: "CANCELLED" });
+  if (signal?.aborted) throw cancelledError();
 }
 
 async function waitFor(check, timeoutMs, label, signal) {
@@ -34,6 +46,27 @@ async function waitFor(check, timeoutMs, label, signal) {
   throw new Error(`Timed out waiting for ${label}${lastError ? `: ${lastError.message}` : ""}`);
 }
 
+// Like waitFor but resolves null instead of throwing when the element never shows up.
+async function waitForOrNull(check, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await check().catch(() => null);
+    if (value) return value;
+    if (Date.now() >= deadline) return null;
+    await sleep(POLL_MS);
+  }
+}
+
+// Single-writer mutex for every UI mutation. Only the broker process calls into
+// this module, so this lock is the global window lock by construction.
+let windowLock = Promise.resolve();
+function withWindowLock(fn) {
+  const previous = windowLock;
+  let release;
+  windowLock = new Promise((resolve) => { release = resolve; });
+  return previous.then(fn).finally(release);
+}
+
 async function mouseClick(connection, rect) {
   await connection.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: rect.x, y: rect.y });
   await connection.send("Input.dispatchMouseEvent", { type: "mousePressed", x: rect.x, y: rect.y, button: "left", clickCount: 1 });
@@ -43,6 +76,17 @@ async function mouseClick(connection, rect) {
 async function pressKey(connection, key, code = key) {
   await connection.send("Input.dispatchKeyEvent", { type: "keyDown", key, code });
   await connection.send("Input.dispatchKeyEvent", { type: "keyUp", key, code });
+}
+
+// Escape stops the generation of whichever task view is focused, so only send
+// it when a popup/menu is actually open - never unconditionally.
+async function dismissPopups(connection) {
+  const open = await connection.evaluate(`(() => {
+    const visible = (e) => e && e.offsetParent !== null;
+    return Array.from(document.querySelectorAll('[role=menu],[role=listbox],[role=dialog],[data-radix-popper-content-wrapper]'))
+      .some(e => visible(e) && e.getAttribute('data-state') !== 'closed');
+  })()`);
+  if (open) await pressKey(connection, "Escape", "Escape");
 }
 
 async function visibleRect(connection, query, mode = "aria", excludeAria = "") {
@@ -110,6 +154,20 @@ function findPromptSession(prompt, afterTime) {
   } finally { db.close(); }
 }
 
+// Resolve the workspace a session belongs to without trusting the caller.
+function sessionWorkspace(sessionId) {
+  const db = openDb();
+  try {
+    for (const column of ["directory", "path"]) {
+      try {
+        const value = db.prepare(`SELECT ${column} AS value FROM session WHERE id = ?`).get(sessionId)?.value;
+        if (value) return value;
+      } catch { /* column does not exist in this ZCode schema */ }
+    }
+    return null;
+  } finally { db.close(); }
+}
+
 function readSession(sessionId) {
   const db = openDb();
   try {
@@ -136,6 +194,14 @@ function findSessionTitle(sessionId) {
   finally { db.close(); }
 }
 
+function partCount(sessionId) {
+  const db = openDb();
+  try { return Number(db.prepare("SELECT COUNT(*) AS value FROM part WHERE session_id = ?").get(sessionId).value); }
+  finally { db.close(); }
+}
+
+// Captcha checks read the shared window, so the result describes the whole
+// ZCode Desktop, not one session. The broker treats it as a global pause.
 async function captchaVisible(connection) {
   const dom = await connection.evaluate(`(() => {
     const visible = (e) => e && e.offsetParent !== null;
@@ -150,7 +216,7 @@ async function captchaVisible(connection) {
 }
 
 async function selectModel(connection, model) {
-  await pressKey(connection, "Escape", "Escape");
+  await dismissPopups(connection);
   const current = await visibleRect(connection, "选择模型", "aria");
   if (!current) throw new Error("ZCode model selector is unavailable");
   const currentModel = () => connection.evaluate(`(() => {
@@ -179,97 +245,193 @@ async function selectMode(connection, mode) {
 async function prepareTask(connection, workspace, model, mode, resumeSessionId) {
   openWorkspace(workspace);
   await sleep(800);
-  await pressKey(connection, "Escape", "Escape");
+  await dismissPopups(connection);
   if (resumeSessionId) {
     if (!findSessionTitle(resumeSessionId)) throw new Error(`Unknown ZCode session: ${resumeSessionId}`);
     await click(connection, `[data-testid=${JSON.stringify(`task-item-${resumeSessionId}`)}]`, "selector");
     await sleep(500);
   } else {
     await click(connection, "新建任务", "aria");
-    await sleep(500);
+    await waitFor(
+      () => visibleRect(connection, '[contenteditable="true"][role="textbox"]', "selector"),
+      10_000,
+      "new task composer",
+    );
   }
   await selectMode(connection, mode);
   await selectModel(connection, model);
 }
 
-async function insertAndSend(connection, prompt) {
-  const rect = await connection.evaluate(`(() => {
+function composerRect(connection) {
+  return connection.evaluate(`(() => {
     const e = Array.from(document.querySelectorAll('[contenteditable="true"][role="textbox"]')).find(x => x.offsetParent !== null);
     if (!e) return null;
     const b = e.getBoundingClientRect();
     return { x: b.x + Math.min(40, b.width / 2), y: b.y + Math.min(20, b.height / 2) };
   })()`);
-  if (!rect) throw new Error("Visible ZCode composer was not found");
-  await mouseClick(connection, rect);
-  await connection.send("Input.dispatchKeyEvent", { type: "keyDown", key: "a", code: "KeyA", modifiers: 2 });
-  await connection.send("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", modifiers: 2 });
-  await pressKey(connection, "Backspace", "Backspace");
-  await connection.send("Input.insertText", { text: prompt });
-  await waitFor(async () => {
-    const send = await visibleRect(connection, "发送", "aria");
-    return send && !send.disabled ? send : null;
-  }, 10_000, "enabled Send button");
+}
+
+function composerFocused(connection) {
+  return connection.evaluate(`(() => {
+    const e = document.activeElement;
+    return !!(e && e.getAttribute && e.getAttribute('contenteditable') === 'true');
+  })()`);
+}
+
+async function focusComposer(connection) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const rect = await composerRect(connection);
+    if (!rect) throw new Error("Visible ZCode composer was not found");
+    await mouseClick(connection, rect);
+    await sleep(250);
+    if (await composerFocused(connection)) return;
+  }
+  throw new Error("ZCode composer did not take focus");
+}
+
+async function insertPrompt(connection, prompt) {
+  // Verify the text actually landed (insertText goes to the focused element
+  // only); re-click and re-insert once otherwise. Under parallel load a view
+  // transition can swallow the first attempt.
+  const suffix = prompt.slice(-40);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await focusComposer(connection);
+    await connection.send("Input.dispatchKeyEvent", { type: "keyDown", key: "a", code: "KeyA", modifiers: 2 });
+    await connection.send("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", modifiers: 2 });
+    await pressKey(connection, "Backspace", "Backspace");
+    await connection.send("Input.insertText", { text: prompt });
+    const inserted = await connection.evaluate(`(() => {
+      const e = Array.from(document.querySelectorAll('[contenteditable="true"][role="textbox"]')).find(x => x.offsetParent !== null);
+      if (!e) return false;
+      return (e.textContent || '').replace(/\\s+$/, '').endsWith(${JSON.stringify(suffix)});
+    })()`);
+    if (inserted) {
+      await waitFor(async () => {
+        const send = await visibleRect(connection, "发送", "aria");
+        return send && !send.disabled ? send : null;
+      }, 10_000, "enabled Send button");
+      return;
+    }
+    await sleep(400);
+  }
+  throw new Error("Failed to insert the prompt into the ZCode composer");
+}
+
+async function sendPrompt(connection) {
   await click(connection, "发送", "aria");
 }
 
-async function cancelActiveTask() {
-  let connection;
-  try {
-    connection = await connectToZCode();
-    const stop = await visibleRect(connection, "停止生成", "aria");
-    if (stop) await mouseClick(connection, stop);
-  } finally { connection?.close(); }
+// Stop a session through the UI. Must be called while holding the window lock.
+// The task-item only exists in its own workspace view, so switch there first
+// and treat a missing stop button as "already stopped" (idempotent).
+async function stopSession(connection, sessionId, fallbackWorkspace) {
+  const workspace = sessionWorkspace(sessionId) || fallbackWorkspace;
+  if (!workspace) throw new Error(`Cannot resolve workspace for ZCode session ${sessionId}`);
+  openWorkspace(workspace);
+  await waitFor(
+    () => visibleRect(connection, `[data-testid=${JSON.stringify(`task-item-${sessionId}`)}]`, "selector"),
+    START_TIMEOUT_MS,
+    `task item for session ${sessionId}`,
+  );
+  await click(connection, `[data-testid=${JSON.stringify(`task-item-${sessionId}`)}]`, "selector");
+  await sleep(500);
+  const stop = await waitForOrNull(() => visibleRect(connection, "停止生成", "aria"), 3_000);
+  if (stop) await mouseClick(connection, stop);
+  return true;
 }
 
-async function runDesktopTask({ workspace, prompt, model, mode = "yolo", resumeSessionId, signal, onSession, onNeedsUserAction }) {
-  await discoverZCodePage().catch(() => {
-    throw new Error("ZCode Desktop CDP is unavailable. Start ZCode.exe with --remote-debugging-port=19223.");
-  });
-  const cutoff = baselineTime();
-  const connection = await connectToZCode();
-  try {
-    throwIfAborted(signal);
-    await prepareTask(connection, workspace, model, mode, resumeSessionId);
-    await insertAndSend(connection, prompt);
-    let waitingForUser = false;
-    const reportCaptchaState = async () => {
-      const visible = await captchaVisible(connection);
-      if (visible !== waitingForUser) {
-        waitingForUser = visible;
-        onNeedsUserAction?.(visible);
-      }
-      return visible;
-    };
-    const sessionDeadline = Date.now() + Math.max(START_TIMEOUT_MS, TASK_TIMEOUT_MS);
-    let sessionRow = null;
-    while (!sessionRow && Date.now() < sessionDeadline) {
+// Phase 1: window-exclusive submission. Holds the window lock for the few
+// seconds of UI work, then returns once the session id is known so the caller
+// can watch it in parallel with every other session.
+//
+// Cancel semantics around the point of no return:
+// - cancelRequested() before Send is clicked -> abort immediately (nothing was submitted);
+// - cancelRequested() after Send was clicked  -> never drop the job: keep
+//   hunting the session id (bounded by CANCEL_HUNT_TIMEOUT_MS), stop the
+//   session inside this same lock, then throw CANCELLED. No orphan sessions.
+async function submitDesktopTask({ workspace, prompt, model, mode = "yolo", resumeSessionId, signal, cancelRequested = () => false, onSent, onSession }) {
+  return withWindowLock(async () => {
+    await discoverZCodePage().catch(() => {
+      throw new Error("ZCode Desktop CDP is unavailable. Start ZCode.exe with --remote-debugging-port=19223.");
+    });
+    const cutoff = baselineTime();
+    const connection = await connectToZCode();
+    try {
       throwIfAborted(signal);
-      sessionRow = findPromptSession(prompt, cutoff);
-      if (sessionRow) break;
-      await reportCaptchaState();
-      await sleep(POLL_MS);
-    }
-    if (!sessionRow) throw new Error("Timed out waiting for ZCode session creation");
-    if (waitingForUser) { waitingForUser = false; onNeedsUserAction?.(false); }
-    onSession?.(sessionRow.id);
-    const final = await waitFor(async () => {
-      const state = readSession(sessionRow.id);
-      if (!state) return null;
-      if (state.usage?.status && !["running", "pending", "completed", "success"].includes(state.usage.status)) return state;
-      if (state.completed) return state;
-      await reportCaptchaState();
-      return null;
-    }, TASK_TIMEOUT_MS, `ZCode session ${sessionRow.id} completion`, signal);
-    if (waitingForUser) onNeedsUserAction?.(false);
-    const failed = final.usage?.status && !["completed", "success"].includes(final.usage.status);
-    return {
-      status: failed ? "failed" : "completed",
-      sessionId: sessionRow.id,
-      output: final.output,
-      diagnostics: failed ? `${final.usage.error_type || "ZCode task failed"}${final.usage.error_code ? ` (${final.usage.error_code})` : ""}` : "",
-      usage: final.usage,
-    };
-  } finally { connection.close(); }
+      if (cancelRequested()) throw cancelledError();
+      await prepareTask(connection, workspace, model, mode, resumeSessionId);
+      await insertPrompt(connection, prompt);
+      throwIfAborted(signal);
+      if (cancelRequested()) throw cancelledError();
+      await sendPrompt(connection);
+      onSent?.();
+      const huntBudget = Math.max(START_TIMEOUT_MS, TASK_TIMEOUT_MS);
+      let sessionDeadline = Date.now() + huntBudget;
+      let sessionRow = null;
+      while (!sessionRow && Date.now() < sessionDeadline) {
+        sessionRow = findPromptSession(prompt, cutoff);
+        if (sessionRow) break;
+        // A cancel arriving mid-hunt clamps the remaining budget: either the
+        // session shows up quickly (it normally persists within a second of
+        // Send) or the job settles as cancelled without hunting for half an hour.
+        if (cancelRequested()) sessionDeadline = Math.min(sessionDeadline, Date.now() + CANCEL_HUNT_TIMEOUT_MS);
+        await sleep(POLL_MS);
+      }
+      if (!sessionRow) {
+        if (cancelRequested()) throw cancelledError("cancelled before the ZCode session became discoverable");
+        throw new Error("Timed out waiting for ZCode session creation");
+      }
+      onSession?.(sessionRow.id);
+      if (cancelRequested()) {
+        await stopSession(connection, sessionRow.id, workspace);
+        throw cancelledError();
+      }
+      return { sessionId: sessionRow.id, workspace };
+    } finally { connection.close(); }
+  });
 }
 
-module.exports = { ZCODE_DB, ZCODE_EXE, cancelActiveTask, runDesktopTask };
+// Phase 2: per-session completion watch. Pure read-only SQLite polling; any
+// number of these run in parallel. Cancellation surfaces via the AbortSignal
+// after the broker stopped the session through the UI.
+async function watchDesktopSession({ sessionId, signal }) {
+  const usageDiagnostics = (usage) => `${usage.error_type || "ZCode task failed"}${usage.error_code ? ` (${usage.error_code})` : ""}`;
+  return waitFor(async () => {
+    const state = readSession(sessionId);
+    if (!state) return null;
+    const usageStatus = state.usage?.status;
+    if (USAGE_CANCELLED.has(usageStatus)) {
+      return { status: "cancelled", sessionId, output: state.output, diagnostics: "", usage: state.usage };
+    }
+    if (USAGE_FAILED.has(usageStatus)) {
+      return { status: "failed", sessionId, output: state.output, diagnostics: usageDiagnostics(state.usage), usage: state.usage };
+    }
+    if (state.completed || USAGE_SUCCESS.has(usageStatus)) {
+      return { status: "completed", sessionId, output: state.output, diagnostics: "", usage: state.usage };
+    }
+    // usage row missing -> judge by final assistant message; unknown future
+    // usage status -> keep waiting rather than misreporting a live turn.
+    return null;
+  }, TASK_TIMEOUT_MS, `ZCode session ${sessionId} completion`, signal);
+}
+
+// Cancel a running session from outside a submission. Takes the window lock
+// because it mutates the UI just like a submission does.
+async function cancelZCodeSession({ sessionId, workspace } = {}) {
+  if (!sessionId) throw new Error("cancelZCodeSession requires sessionId");
+  return withWindowLock(async () => {
+    const connection = await connectToZCode();
+    try { return await stopSession(connection, sessionId, workspace); }
+    finally { connection.close(); }
+  });
+}
+
+module.exports = {
+  ZCODE_DB,
+  ZCODE_EXE,
+  cancelZCodeSession,
+  captchaVisible,
+  partCount,
+  submitDesktopTask,
+  watchDesktopSession,
+};

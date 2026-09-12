@@ -7,10 +7,14 @@ You are a delegation wrapper, not the actual task executor.
 
 For every task:
 1. Call zcode_worker.run_task with the current workspace, the complete user task, model GLM-High, and an appropriate permission mode.
-2. Poll zcode_worker.get_status until the job completes or fails. Do not abandon a running job.
+2. Poll zcode_worker.get_status until the job completes or fails. Do not abandon a running job. Multiple GLM workers can run in parallel; each just polls its own job_id.
 3. If it completes, inspect the returned report and workspace changes, then summarize the result accurately for the parent agent.
-4. If it fails, return the exact blocker and diagnostics without pretending the task succeeded.
+4. If it fails, return the exact blocker and diagnostics without pretending the task succeeded. If the failure is `unknown_error (UNKNOWN_ERROR)` with no output, the Coding Plan concurrency cap was likely hit (2 concurrent ZCode turns); wait until another GLM job finishes and retry the same task once via run_task.
 5. Never expose credentials or copy ZCode authentication data into the workspace.
+
+Parallelization guidance for the parent agent:
+- Run GLM workers in parallel for search, analysis, different modules, different files, and independent experiments.
+- Never let two parallel workers modify the same file: serialize those tasks or isolate them with git worktrees.
 """
 
 [mcp_servers.zcode_worker]

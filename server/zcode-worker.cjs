@@ -1,28 +1,25 @@
 #!/usr/bin/env node
 "use strict";
 
-const fs = require("node:fs");
-const os = require("node:os");
+// Thin MCP wrapper: speaks stdio JSON-RPC 2.0 to Codex and relays every tool
+// call to the singleton zcode-broker over loopback TCP. Codex may spawn one
+// wrapper process per subagent; the broker is what actually serializes UI
+// access and parallelizes session watching, so multiple wrappers are safe.
+// If no broker is reachable, one is spawned detached and the connection is
+// retried (concurrent spawns converge: the loser exits on EADDRINUSE).
+
+const net = require("node:net");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
-const { randomUUID } = require("node:crypto");
-const { cancelActiveTask, runDesktopTask } = require("../desktop/zcode-desktop.cjs");
 
-const SERVER = { name: "codex-zcode-worker", version: "0.2.0" };
-const NODE_EXE = process.env.ZCODE_NODE_EXE || "E:\\Node.js\\node.exe";
-const ZCODE_CLI = process.env.ZCODE_CLI || "E:\\ZCode\\resources\\glm\\zcode.cjs";
-const ZCODE_CONFIG = process.env.ZCODE_CONFIG || path.join(os.homedir(), ".zcode", "v2", "config.json");
-const PROVIDER_ID = process.env.ZCODE_PROVIDER_ID || "builtin:bigmodel-start-plan";
-const MAX_OUTPUT_CHARS = 120_000;
-const jobs = new Map();
-let desktopQueue = Promise.resolve();
+const SERVER = { name: "codex-zcode-worker", version: "0.3.0" };
+const BROKER_PATH = path.join(__dirname, "zcode-broker.cjs");
+const BROKER_PORT = Number(process.env.ZCODE_BROKER_PORT || 19224);
+const BROKER_START_ATTEMPTS = 40;
+const BROKER_START_RETRY_MS = 250;
+const BROKER_REQUEST_TIMEOUT_MS = 60_000;
 
-const MODELS = Object.freeze({
-  "GLM-High": "GLM-5.3",
-  "GLM-Flash": "GLM-5.3-Flash",
-  "glm5.3": "GLM-5.3",
-  "glm5.3flash": "GLM-5.3-Flash",
-});
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -32,184 +29,64 @@ function textResult(value, isError = false) {
   return { content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }], isError };
 }
 
-function safeTail(value) {
-  return value.length <= MAX_OUTPUT_CHARS ? value : `[output truncated]\n${value.slice(-MAX_OUTPUT_CHARS)}`;
-}
-
-function redactSensitive(value) {
-  return value
-    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [REDACTED]")
-    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED_JWT]")
-    .replace(/(['"]?(?:authorization|x-api-key|api[_-]?key|set-cookie|cookie|token|x-aliyun-captcha-verify-param)['"]?\s*:\s*['"])[^'"\r\n]*(['"])/gi, "$1[REDACTED]$2");
-}
-
-function loadProvider() {
-  const config = JSON.parse(fs.readFileSync(ZCODE_CONFIG, "utf8"));
-  const provider = config?.provider?.[PROVIDER_ID];
-  if (!provider?.options?.apiKey || !provider?.options?.baseURL) {
-    throw new Error(`ZCode provider ${PROVIDER_ID} is missing apiKey/baseURL in ${ZCODE_CONFIG}`);
-  }
-  return provider;
-}
-
-function resolveWorkspace(input) {
-  if (!input || typeof input !== "string") throw new Error("workspace is required");
-  const workspace = path.resolve(input);
-  if (!path.isAbsolute(workspace) || !fs.statSync(workspace).isDirectory()) {
-    throw new Error(`workspace is not a directory: ${workspace}`);
-  }
-  return workspace;
-}
-
-function resolveModel(input) {
-  const model = MODELS[input || "GLM-High"];
-  if (!model) throw new Error(`unsupported model: ${input}. Use GLM-High or GLM-Flash.`);
-  return model;
-}
-
-function delegatedPrompt(task, model) {
-  return [
-    "You are the ZCode main agent operating in the current workspace.",
-    `Delegate the following task to a general-purpose subagent using ${model}.`,
-    "The subagent must inspect the workspace itself, obey AGENTS.md and project memory, use tools as needed, validate its work, and summarize results back to you.",
-    "Return a concise final report including changed files, validation performed, and any blocker.",
-    "",
-    "TASK:",
-    task,
-  ].join("\n");
-}
-
-function startCliJob({ workspace, task, model, mode = "yolo", resumeSessionId }) {
-  if (!task || typeof task !== "string") throw new Error("task is required");
-  const cwd = resolveWorkspace(workspace);
-  const resolvedModel = resolveModel(model);
-  const provider = loadProvider();
-  const jobId = `zjob_${randomUUID()}`;
-  const args = [ZCODE_CLI, "--surface", "desktop", "--cwd", cwd, "--mode", mode, "--json", "--no-color"];
-  if (resumeSessionId) args.push("--resume", resumeSessionId);
-  args.push("--prompt", delegatedPrompt(task, resolvedModel));
-
-  const providerName = PROVIDER_ID.replace(/^builtin:/, "");
-  const child = spawn(NODE_EXE, args, {
-    cwd,
-    windowsHide: true,
-    env: {
-      ...process.env,
-      ZCODE_API_KEY: provider.options.apiKey,
-      ZCODE_BASE_URL: provider.options.baseURL,
-      ZCODE_MODEL: `${providerName}/${resolvedModel}`,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
+function brokerRequest(method, params) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(BROKER_PORT, "127.0.0.1");
+    let buffer = "";
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      reject(error);
+    };
+    socket.setTimeout(BROKER_REQUEST_TIMEOUT_MS);
+    socket.on("timeout", () => fail(Object.assign(new Error("broker request timed out"), { code: "ETIMEDOUT" })));
+    socket.on("error", fail);
+    socket.on("connect", () => socket.write(`${JSON.stringify({ id: 1, method, params })}\n`));
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      if (settled) return;
+      settled = true;
+      socket.end();
+      try {
+        const message = JSON.parse(buffer.slice(0, newline));
+        if (message.error) reject(new Error(message.error.message || "broker error"));
+        else resolve(message.result);
+      } catch (error) {
+        reject(error);
+      }
+    });
   });
-
-  const job = {
-    jobId,
-    status: "running",
-    model: resolvedModel,
-    workspace: cwd,
-    startedAt: new Date().toISOString(),
-    completedAt: null,
-    exitCode: null,
-    stdout: "",
-    stderr: "",
-    child,
-  };
-  jobs.set(jobId, job);
-
-  child.stdout.on("data", (chunk) => { job.stdout = safeTail(job.stdout + chunk.toString("utf8")); });
-  child.stderr.on("data", (chunk) => { job.stderr = safeTail(job.stderr + chunk.toString("utf8")); });
-  child.on("error", (error) => {
-    job.status = "failed";
-    job.stderr = safeTail(`${job.stderr}\n${error.stack || error.message}`);
-    job.completedAt = new Date().toISOString();
-  });
-  child.on("close", (code, signal) => {
-    job.exitCode = code;
-    if (job.status === "running") job.status = code === 0 ? "completed" : "failed";
-    if (signal) job.stderr = safeTail(`${job.stderr}\nTerminated by ${signal}`);
-    job.completedAt = new Date().toISOString();
-    job.child = null;
-  });
-  return job;
 }
 
-function startDesktopJob({ workspace, task, model, mode = "yolo", resumeSessionId }) {
-  if (!task || typeof task !== "string") throw new Error("task is required");
-  const cwd = resolveWorkspace(workspace);
-  const resolvedModel = resolveModel(model);
-  const jobId = `zjob_${randomUUID()}`;
-  const abortController = new AbortController();
-  const job = {
-    jobId, status: "queued", model: resolvedModel, workspace: cwd,
-    startedAt: new Date().toISOString(), completedAt: null, exitCode: null,
-    sessionId: null, stdout: "", stderr: "", child: null, abortController,
-  };
-  jobs.set(jobId, job);
-  const execute = async () => {
-    if (job.status === "cancelled") return;
-    job.status = "running";
+function spawnBroker() {
+  const child = spawn(process.execPath, [BROKER_PATH], { detached: true, stdio: "ignore", windowsHide: true });
+  child.unref();
+}
+
+async function callBroker(method, params) {
+  let lastError;
+  for (let attempt = 0; attempt <= BROKER_START_ATTEMPTS; attempt += 1) {
     try {
-      const result = await runDesktopTask({
-        workspace: cwd,
-        prompt: delegatedPrompt(task, resolvedModel),
-        model: resolvedModel,
-        mode,
-        resumeSessionId,
-        signal: abortController.signal,
-        onSession: (id) => { job.sessionId = id; },
-        onNeedsUserAction: (needed) => { job.status = needed ? "needs_user_action" : "running"; },
-      });
-      job.status = result.status;
-      job.sessionId = result.sessionId;
-      job.stdout = safeTail(result.output || "");
-      job.stderr = safeTail(result.diagnostics || "");
-      job.exitCode = result.status === "completed" ? 0 : 1;
+      return await brokerRequest(method, params);
     } catch (error) {
-      if (error.code === "CANCELLED" || abortController.signal.aborted) job.status = "cancelled";
-      else job.status = "failed";
-      job.stderr = safeTail(error.stack || error.message);
-      job.exitCode = 1;
-    } finally {
-      job.completedAt = new Date().toISOString();
-    }
-  };
-  desktopQueue = desktopQueue.then(execute, execute);
-  return job;
-}
-
-function startJob(args) {
-  return (process.env.ZCODE_TRANSPORT || "desktop").toLowerCase() === "cli" ? startCliJob(args) : startDesktopJob(args);
-}
-
-function publicJob(job, includeOutput = true) {
-  const sessionId = job.sessionId || `${job.stdout}\n${job.stderr}`.match(/sess_[0-9a-f-]{20,}/i)?.[0] || null;
-  const result = {
-    job_id: job.jobId,
-    status: job.status,
-    model: job.model,
-    workspace: job.workspace,
-    started_at: job.startedAt,
-    completed_at: job.completedAt,
-    exit_code: job.exitCode,
-    session_id: sessionId,
-  };
-  if (includeOutput) {
-    result.output = redactSensitive(job.stdout.trim());
-    result.diagnostics = redactSensitive(job.stderr.trim());
-    if (/captcha verify failed/i.test(job.stderr)) {
-      result.blocker = "ZCode Coding Plan rejected the standalone CLI because desktop captcha runtime headers are unavailable.";
-    }
-    if (job.status === "needs_user_action") {
-      result.blocker = "Complete the captcha in the visible ZCode Desktop window; this job will resume automatically.";
+      lastError = error;
+      const connectFailure = ["ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT"].includes(error.code);
+      if (!connectFailure || attempt === BROKER_START_ATTEMPTS) break;
+      if (attempt === 0) spawnBroker();
+      await sleep(BROKER_START_RETRY_MS);
     }
   }
-  return result;
+  throw new Error(`zcode-broker unreachable on 127.0.0.1:${BROKER_PORT}: ${lastError?.message || "unknown error"}`);
 }
 
 const tools = [
   {
     name: "run_task",
-    description: "Start a task through the logged-in ZCode Desktop using GLM-5.3 or GLM-5.3-Flash. Returns immediately with a job_id.",
+    description: "Start a task through the logged-in ZCode Desktop using GLM-5.3 or GLM-5.3-Flash. Returns immediately with a job_id. Multiple jobs run in parallel (each takes a semaphore slot); poll each job_id with get_status.",
     inputSchema: {
       type: "object",
       properties: {
@@ -224,7 +101,7 @@ const tools = [
   },
   {
     name: "continue_task",
-    description: "Resume a persisted ZCode Desktop session with another instruction.",
+    description: "Resume a persisted ZCode Desktop session with another instruction. A session can only run one job at a time.",
     inputSchema: {
       type: "object",
       properties: {
@@ -238,39 +115,22 @@ const tools = [
   },
   {
     name: "get_status",
-    description: "Get status and accumulated output for a ZCode task.",
+    description: "Get status and accumulated output for a ZCode task. Statuses: queued, running, needs_user_action, cancelling, completed, failed, cancelled.",
     inputSchema: { type: "object", properties: { job_id: { type: "string" } }, required: ["job_id"], additionalProperties: false },
   },
   {
     name: "cancel_task",
-    description: "Cancel a running ZCode task.",
+    description: "Cancel a ZCode task. Safe at any phase: after Send the broker first stops the ZCode session (no orphan sessions keep burning tokens), then finalizes the job as cancelled.",
     inputSchema: { type: "object", properties: { job_id: { type: "string" } }, required: ["job_id"], additionalProperties: false },
   },
 ];
 
 async function callTool(name, args) {
-  if (name === "run_task") return textResult(publicJob(startJob(args), false));
-  if (name === "continue_task") return textResult(publicJob(startJob({ ...args, resumeSessionId: args.session_id }), false));
-  if (name === "get_status") {
-    const job = jobs.get(args.job_id);
-    return job ? textResult(publicJob(job)) : textResult(`unknown job_id: ${args.job_id}`, true);
+  if (!["run_task", "continue_task", "get_status", "cancel_task"].includes(name)) {
+    return textResult(`unknown tool: ${name}`, true);
   }
-  if (name === "cancel_task") {
-    const job = jobs.get(args.job_id);
-    if (!job) return textResult(`unknown job_id: ${args.job_id}`, true);
-    if (job.child && job.status === "running") {
-      job.status = "cancelled";
-      job.completedAt = new Date().toISOString();
-      job.child.kill();
-    } else if (["queued", "running", "needs_user_action"].includes(job.status)) {
-      job.status = "cancelled";
-      job.completedAt = new Date().toISOString();
-      job.abortController?.abort();
-      if (job.sessionId) await cancelActiveTask();
-    }
-    return textResult(publicJob(job));
-  }
-  return textResult(`unknown tool: ${name}`, true);
+  const result = await callBroker(name, args || {});
+  return textResult(result);
 }
 
 async function handle(request) {
@@ -306,8 +166,4 @@ process.stdin.on("data", (chunk) => {
     try { void handle(JSON.parse(line)); }
     catch (error) { process.stderr.write(`Invalid MCP message: ${error.message}\n`); }
   }
-});
-
-process.on("exit", () => {
-  for (const job of jobs.values()) if (job.child) job.child.kill();
 });

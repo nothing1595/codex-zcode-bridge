@@ -16,7 +16,9 @@ function Install-AgentTemplate([string]$Name) {
     $template = Get-Content -Raw -LiteralPath (Join-Path $sourceDir $Name)
     $rendered = $template.Replace('__NODE_EXE__', (ConvertTo-TomlBasicStringValue $nodeExe))
     $rendered = $rendered.Replace('__ZCODE_BRIDGE_SERVER__', (ConvertTo-TomlBasicStringValue $serverPath))
-    Set-Content -LiteralPath (Join-Path $targetDir $Name) -Value $rendered -Encoding utf8NoBOM
+    # utf8NoBOM encoding is PowerShell 7+ only; .NET works on 5.1 too.
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText((Join-Path $targetDir $Name), $rendered, $utf8NoBom)
 }
 
 New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
