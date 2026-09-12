@@ -1,0 +1,11 @@
+{
+  "model": {
+    "main": {
+      "provider": "bigmodel-start-plan",
+      "providerName": "BigModel Coding Plan",
+      "model": "GLM-5.3",
+      "kind": "anthropic",
+      "baseURL": "https://zcode.z.ai/api/v1/zcode-plan/anthropic"
+    }
+  }
+}
