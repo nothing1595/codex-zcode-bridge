@@ -67,7 +67,7 @@ Note: the delegated subagent inside ZCode always starts fresh by design; the ZCo
 2. Keep ZCode Desktop logged in.
 3. Run `scripts\install-agents.ps1`, restart Codex, and ask the main agent to spawn `glm53_worker` or `glm53_flash_worker`.
 
-The installer resolves Node and the bridge directory, then renders portable agent templates into your Codex home.
+The installer resolves Node and the bridge directory, renders portable agent templates into your Codex home, and registers `zcode_worker` globally so spawned custom agents inherit the MCP tools. Restart Codex after installation or configuration changes.
 
 The MCP process reads the enabled BigModel Start Plan provider from `%USERPROFILE%\.zcode\v2\config.json` at runtime. It does not copy credentials to this repository.
 
