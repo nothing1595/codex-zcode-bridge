@@ -6,14 +6,16 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
+const { cancelActiveTask, runDesktopTask } = require("../desktop/zcode-desktop.cjs");
 
-const SERVER = { name: "codex-zcode-worker", version: "0.1.0" };
+const SERVER = { name: "codex-zcode-worker", version: "0.2.0" };
 const NODE_EXE = process.env.ZCODE_NODE_EXE || "E:\\Node.js\\node.exe";
 const ZCODE_CLI = process.env.ZCODE_CLI || "E:\\ZCode\\resources\\glm\\zcode.cjs";
 const ZCODE_CONFIG = process.env.ZCODE_CONFIG || path.join(os.homedir(), ".zcode", "v2", "config.json");
 const PROVIDER_ID = process.env.ZCODE_PROVIDER_ID || "builtin:bigmodel-start-plan";
 const MAX_OUTPUT_CHARS = 120_000;
 const jobs = new Map();
+let desktopQueue = Promise.resolve();
 
 const MODELS = Object.freeze({
   "GLM-High": "GLM-5.3",
@@ -77,7 +79,7 @@ function delegatedPrompt(task, model) {
   ].join("\n");
 }
 
-function startJob({ workspace, task, model, mode = "yolo", resumeSessionId }) {
+function startCliJob({ workspace, task, model, mode = "yolo", resumeSessionId }) {
   if (!task || typeof task !== "string") throw new Error("task is required");
   const cwd = resolveWorkspace(workspace);
   const resolvedModel = resolveModel(model);
@@ -131,8 +133,56 @@ function startJob({ workspace, task, model, mode = "yolo", resumeSessionId }) {
   return job;
 }
 
+function startDesktopJob({ workspace, task, model, mode = "yolo", resumeSessionId }) {
+  if (!task || typeof task !== "string") throw new Error("task is required");
+  const cwd = resolveWorkspace(workspace);
+  const resolvedModel = resolveModel(model);
+  const jobId = `zjob_${randomUUID()}`;
+  const abortController = new AbortController();
+  const job = {
+    jobId, status: "queued", model: resolvedModel, workspace: cwd,
+    startedAt: new Date().toISOString(), completedAt: null, exitCode: null,
+    sessionId: null, stdout: "", stderr: "", child: null, abortController,
+  };
+  jobs.set(jobId, job);
+  const execute = async () => {
+    if (job.status === "cancelled") return;
+    job.status = "running";
+    try {
+      const result = await runDesktopTask({
+        workspace: cwd,
+        prompt: delegatedPrompt(task, resolvedModel),
+        model: resolvedModel,
+        mode,
+        resumeSessionId,
+        signal: abortController.signal,
+        onSession: (id) => { job.sessionId = id; },
+        onNeedsUserAction: (needed) => { job.status = needed ? "needs_user_action" : "running"; },
+      });
+      job.status = result.status;
+      job.sessionId = result.sessionId;
+      job.stdout = safeTail(result.output || "");
+      job.stderr = safeTail(result.diagnostics || "");
+      job.exitCode = result.status === "completed" ? 0 : 1;
+    } catch (error) {
+      if (error.code === "CANCELLED" || abortController.signal.aborted) job.status = "cancelled";
+      else job.status = "failed";
+      job.stderr = safeTail(error.stack || error.message);
+      job.exitCode = 1;
+    } finally {
+      job.completedAt = new Date().toISOString();
+    }
+  };
+  desktopQueue = desktopQueue.then(execute, execute);
+  return job;
+}
+
+function startJob(args) {
+  return (process.env.ZCODE_TRANSPORT || "desktop").toLowerCase() === "cli" ? startCliJob(args) : startDesktopJob(args);
+}
+
 function publicJob(job, includeOutput = true) {
-  const sessionId = `${job.stdout}\n${job.stderr}`.match(/sess_[0-9a-f-]{20,}/i)?.[0] || null;
+  const sessionId = job.sessionId || `${job.stdout}\n${job.stderr}`.match(/sess_[0-9a-f-]{20,}/i)?.[0] || null;
   const result = {
     job_id: job.jobId,
     status: job.status,
@@ -149,6 +199,9 @@ function publicJob(job, includeOutput = true) {
     if (/captcha verify failed/i.test(job.stderr)) {
       result.blocker = "ZCode Coding Plan rejected the standalone CLI because desktop captcha runtime headers are unavailable.";
     }
+    if (job.status === "needs_user_action") {
+      result.blocker = "Complete the captcha in the visible ZCode Desktop window; this job will resume automatically.";
+    }
   }
   return result;
 }
@@ -156,7 +209,7 @@ function publicJob(job, includeOutput = true) {
 const tools = [
   {
     name: "run_task",
-    description: "Start a task in the current ZCode workspace through a GLM-5.3 or GLM-5.3-Flash worker. Returns immediately with a job_id.",
+    description: "Start a task through the logged-in ZCode Desktop using GLM-5.3 or GLM-5.3-Flash. Returns immediately with a job_id.",
     inputSchema: {
       type: "object",
       properties: {
@@ -171,7 +224,7 @@ const tools = [
   },
   {
     name: "continue_task",
-    description: "Resume a persisted ZCode session with another instruction.",
+    description: "Resume a persisted ZCode Desktop session with another instruction.",
     inputSchema: {
       type: "object",
       properties: {
@@ -209,6 +262,11 @@ async function callTool(name, args) {
       job.status = "cancelled";
       job.completedAt = new Date().toISOString();
       job.child.kill();
+    } else if (["queued", "running", "needs_user_action"].includes(job.status)) {
+      job.status = "cancelled";
+      job.completedAt = new Date().toISOString();
+      job.abortController?.abort();
+      if (job.sessionId) await cancelActiveTask();
     }
     return textResult(publicJob(job));
   }
