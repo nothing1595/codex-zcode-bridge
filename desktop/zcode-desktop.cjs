@@ -122,6 +122,27 @@ function openWorkspace(workspace) {
   child.unref();
 }
 
+// ZCode keeps the workspace shell mounted behind Settings. Elements in that
+// shell can still have an offsetParent, so generic "visible" checks may find
+// controls that are actually covered by the Settings page. Always leave
+// Settings explicitly before interacting with the composer.
+async function ensureWorkspaceView(connection) {
+  const settingsBack = await visibleRect(connection, '[data-testid="settings-back-button"]', "selector");
+  if (settingsBack) {
+    await mouseClick(connection, settingsBack);
+    await waitFor(
+      async () => !(await visibleRect(connection, '[data-testid="settings-back-button"]', "selector")),
+      10_000,
+      "ZCode Settings to close",
+    );
+  }
+  await waitFor(
+    () => visibleRect(connection, '[data-testid="conversation-new-task"]', "selector"),
+    10_000,
+    "ZCode workspace view",
+  );
+}
+
 function openDb() {
   if (!fs.existsSync(ZCODE_DB)) throw new Error(`ZCode database was not found: ${ZCODE_DB}`);
   return new DatabaseSync(ZCODE_DB, { readOnly: true });
@@ -251,6 +272,7 @@ async function selectMode(connection, mode) {
 async function prepareTask(connection, workspace, model, mode, resumeSessionId) {
   openWorkspace(workspace);
   await sleep(800);
+  await ensureWorkspaceView(connection);
   await dismissPopups(connection);
   if (resumeSessionId) {
     if (!findSessionTitle(resumeSessionId)) throw new Error(`Unknown ZCode session: ${resumeSessionId}`);
@@ -279,17 +301,30 @@ function composerRect(connection) {
 
 function composerFocused(connection) {
   return connection.evaluate(`(() => {
-    const e = document.activeElement;
-    return !!(e && e.getAttribute && e.getAttribute('contenteditable') === 'true');
+    const composer = Array.from(document.querySelectorAll('[contenteditable="true"][role="textbox"]')).find(x => x.offsetParent !== null);
+    const active = document.activeElement;
+    return !!(composer && active && (active === composer || composer.contains(active)));
   })()`);
 }
 
 async function focusComposer(connection) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const rect = await composerRect(connection);
-    if (!rect) throw new Error("Visible ZCode composer was not found");
+    // Workspace opening is asynchronous and can briefly restore the previous
+    // Settings route after prepareTask already closed it. Re-check immediately
+    // before every focus attempt.
+    await ensureWorkspaceView(connection);
+    const rect = await waitForOrNull(() => composerRect(connection), 3_000);
+    if (!rect) continue;
     await mouseClick(connection, rect);
     await sleep(250);
+    if (await composerFocused(connection)) return;
+    // CDP's physical click can be swallowed by a view transition. DOM focus is
+    // a safe fallback; text insertion is still verified before Send is enabled.
+    await connection.evaluate(`(() => {
+      const composer = Array.from(document.querySelectorAll('[contenteditable="true"][role="textbox"]')).find(x => x.offsetParent !== null);
+      composer?.focus();
+    })()`);
+    await sleep(100);
     if (await composerFocused(connection)) return;
   }
   throw new Error("ZCode composer did not take focus");
@@ -334,6 +369,8 @@ async function stopSession(connection, sessionId, fallbackWorkspace) {
   const workspace = sessionWorkspace(sessionId) || fallbackWorkspace;
   if (!workspace) throw new Error(`Cannot resolve workspace for ZCode session ${sessionId}`);
   openWorkspace(workspace);
+  await sleep(500);
+  await ensureWorkspaceView(connection);
   await waitFor(
     () => visibleRect(connection, `[data-testid=${JSON.stringify(`task-item-${sessionId}`)}]`, "selector"),
     START_TIMEOUT_MS,
