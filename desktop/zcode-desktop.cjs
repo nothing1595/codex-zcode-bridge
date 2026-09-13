@@ -242,31 +242,61 @@ async function captchaVisible(connection) {
   return targets.some((target) => /验证码|captcha|安全验证/i.test(`${target.title} ${target.url}`));
 }
 
+// Dropdown triggers (mode/model selectors) can swallow a physical CDP click
+// during view transitions - the same flake class as composer focus. Retry
+// with a fresh rect, fall back to a DOM click, and clean stray popups between
+// attempts. A fresh task always starts in a non-yolo mode, so this path runs
+// on every submission.
+async function openMenu(connection, triggerQuery, triggerMode, itemQuery, itemMode, excludeAria, label) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (attempt === 1) {
+      await connection.evaluate(`(() => {
+        const e = Array.from(document.querySelectorAll(${JSON.stringify(triggerMode === "selector" ? triggerQuery : `[aria-label="${triggerQuery}"]`)})).find(x => x.offsetParent !== null);
+        e?.click();
+      })()`);
+    } else {
+      const rect = await visibleRect(connection, triggerQuery, triggerMode);
+      if (rect) await mouseClick(connection, rect);
+    }
+    const item = await waitForOrNull(() => visibleRect(connection, itemQuery, itemMode, excludeAria), 4_000);
+    if (item) return item;
+    await dismissPopups(connection);
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
 async function selectModel(connection, model) {
   await dismissPopups(connection);
-  const current = await visibleRect(connection, "选择模型", "aria");
-  if (!current) throw new Error("ZCode model selector is unavailable");
   const currentModel = () => connection.evaluate(`(() => {
     const button = Array.from(document.querySelectorAll('[aria-label="选择模型"]')).find(e => e.offsetParent !== null);
     return button?.querySelector('[title]')?.getAttribute('title') || null;
   })()`);
-  if (await currentModel() === model) return;
-  await mouseClick(connection, current);
-  await waitFor(() => visibleRect(connection, model, "text", "选择模型"), 10_000, `${model} menu item`);
-  await click(connection, model, "text", "选择模型");
-  await waitFor(async () => await currentModel() === model, 10_000, `${model} selection`);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (await currentModel() === model) return;
+    const item = await openMenu(connection, "选择模型", "aria", model, "text", "选择模型", `${model} menu item`);
+    await mouseClick(connection, item);
+    const settled = await waitForOrNull(async () => (await currentModel()) === model, 8_000);
+    if (settled) return;
+    await dismissPopups(connection);
+  }
+  throw new Error(`Timed out waiting for ${model} selection`);
 }
 
 async function selectMode(connection, mode) {
   const labels = { build: "自动编辑", edit: "变更前确认", plan: "计划模式", yolo: "完全访问" };
   const target = labels[mode] || labels.yolo;
-  const current = await visibleRect(connection, "切换模式", "aria");
-  if (!current) throw new Error("ZCode permission mode selector is unavailable");
-  if (current.text.includes(target)) return;
-  await mouseClick(connection, current);
-  await waitFor(() => visibleRect(connection, target, "text", "切换模式"), 10_000, `${target} mode item`);
-  await click(connection, target, "text", "切换模式");
-  await waitFor(async () => (await visibleRect(connection, "切换模式", "aria"))?.text.includes(target), 10_000, `${target} mode selection`);
+  const currentText = async () => (await visibleRect(connection, "切换模式", "aria"))?.text || null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const current = await currentText();
+    if (!current) throw new Error("ZCode permission mode selector is unavailable");
+    if (current.includes(target)) return;
+    const item = await openMenu(connection, "切换模式", "aria", target, "text", "切换模式", `${target} mode item`);
+    await mouseClick(connection, item);
+    const settled = await waitForOrNull(async () => ((await currentText()) || "").includes(target) || null, 8_000);
+    if (settled) return;
+    await dismissPopups(connection);
+  }
+  throw new Error(`Timed out waiting for ${target} mode selection`);
 }
 
 async function prepareTask(connection, workspace, model, mode, resumeSessionId) {
