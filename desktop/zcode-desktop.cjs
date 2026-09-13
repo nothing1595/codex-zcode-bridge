@@ -35,12 +35,20 @@ function throwIfAborted(signal) {
 async function waitFor(check, timeoutMs, label, signal) {
   const deadline = Date.now() + timeoutMs;
   let lastError;
+  let consecutiveErrors = 0;
   while (Date.now() < deadline) {
     throwIfAborted(signal);
     try {
       const value = await check();
+      consecutiveErrors = 0;
       if (value) return value;
-    } catch (error) { lastError = error; }
+    } catch (error) {
+      lastError = error;
+      // A poll that keeps failing (broken query, missing table) must fail the
+      // job instead of silently draining the whole timeout budget.
+      consecutiveErrors += 1;
+      if (consecutiveErrors >= 20) throw new Error(`poll for ${label} kept failing: ${error.message}`);
+    }
     await sleep(POLL_MS);
   }
   throw new Error(`Timed out waiting for ${label}${lastError ? `: ${lastError.message}` : ""}`);
@@ -211,7 +219,21 @@ function readSession(sessionId) {
     const outputMessageIds = new Set((finalMessages.length ? finalMessages : currentAssistants).map((m) => m.id));
     const output = parts.filter((p) => outputMessageIds.has(p.message_id) && p.parsed.type === "text").map((p) => p.parsed.text || "").join("\n").trim();
     const completed = finalMessages.length > 0;
-    return { session, messages, parts, usage, output, completed };
+    // Plan approvals (ExitPlanMode) and agent questions (AskUserQuestion)
+    // block the turn until a human answers - a hang risk for unattended runs.
+    // The blocking call may sit in the watched parent session OR in one of its
+    // subagent children (the main agent delegates the asking), so check both.
+    const blocking = db.prepare(`
+      SELECT COALESCE(json_extract(p.data, '$.tool'), '') AS tool, json_extract(p.data, '$.callID') AS callId
+      FROM part p
+      WHERE p.session_id IN (SELECT id FROM session WHERE id = ? OR parent_id = ?)
+        AND json_extract(p.data, '$.type') = 'tool'
+        AND json_extract(p.data, '$.tool') IN ('ExitPlanMode', 'AskUserQuestion')
+        AND COALESCE(json_extract(p.data, '$.state.status'), '') NOT IN ('completed', 'error', 'cancelled')
+    `).all(sessionId, sessionId);
+    const planCall = blocking.find((r) => r.tool === "ExitPlanMode") || null;
+    const questionCall = blocking.find((r) => r.tool === "AskUserQuestion") || null;
+    return { session, messages, parts, usage, output, completed, pendingPlanCallId: planCall?.callId || null, pendingQuestionCallId: questionCall?.callId || null };
   } finally { db.close(); }
 }
 
@@ -464,11 +486,56 @@ async function submitDesktopTask({ workspace, prompt, model, mode = "yolo", resu
   });
 }
 
+// Approve a pending ExitPlanMode card by clicking its 批准 button ("退出计划
+// 模式并开始实施"). Takes the window lock and navigates to the session's own
+// task view first, because the card lives there. Returns true when the plan
+// approval is observed cleared in the session store.
+async function approvePendingPlan(sessionId, fallbackWorkspace, onLog) {
+  return withWindowLock(async () => {
+    const workspace = sessionWorkspace(sessionId) || fallbackWorkspace;
+    if (!workspace) { onLog?.(`approve ${sessionId}: no workspace, giving up`); return false; }
+    const connection = await connectToZCode();
+    try {
+      openWorkspace(workspace);
+      await sleep(500);
+      await ensureWorkspaceView(connection);
+      const item = `[data-testid=${JSON.stringify(`task-item-${sessionId}`)}]`;
+      const itemRect = await waitForOrNull(() => visibleRect(connection, item, "selector"), START_TIMEOUT_MS);
+      if (!itemRect) { onLog?.(`approve ${sessionId}: task item not found`); return false; }
+      await mouseClick(connection, itemRect);
+      await sleep(600);
+      // body.innerText survives React splitting the card title across spans;
+      // exact-leaf matching does not.
+      const approveButton = () => connection.evaluate(`(() => {
+        const visible = (e) => e && e.offsetParent !== null && e.getBoundingClientRect().width > 0;
+        if (!(document.body.innerText || '').includes('请审阅此实施计划')) return null;
+        const btn = Array.from(document.querySelectorAll('button')).find(b => visible(b) && (b.innerText || '').trim() === '批准');
+        if (!btn) return null;
+        const box = btn.getBoundingClientRect();
+        return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+      })()`);
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const rect = await waitForOrNull(approveButton, 4_000);
+        if (!rect) { onLog?.(`approve ${sessionId}: approval card/button not found (attempt ${attempt + 1})`); break; }
+        await mouseClick(connection, rect);
+        onLog?.(`approve ${sessionId}: clicked 批准 (attempt ${attempt + 1})`);
+        const cleared = await waitForOrNull(() => (readSession(sessionId)?.pendingPlanCallId == null ? true : null), 10_000);
+        if (cleared) { onLog?.(`approve ${sessionId}: approval cleared`); return true; }
+        onLog?.(`approve ${sessionId}: still pending after click, ${attempt === 0 ? 'retrying' : 'giving up'}`);
+      }
+      return readSession(sessionId)?.pendingPlanCallId == null;
+    } finally { connection.close(); }
+  });
+}
+
 // Phase 2: per-session completion watch. Pure read-only SQLite polling; any
-// number of these run in parallel. Cancellation surfaces via the AbortSignal
-// after the broker stopped the session through the UI.
-async function watchDesktopSession({ sessionId, signal }) {
+// number of these run in parallel. Pending plan approvals are auto-approved
+// (that is the yolo semantic the bridge promises); pending agent questions
+// cannot be auto-answered and are reported through onAwaitingUser so the
+// caller can surface needs_user_action.
+async function watchDesktopSession({ sessionId, signal, fallbackWorkspace, onAwaitingUser, onLog }) {
   const usageDiagnostics = (usage) => `${usage.error_type || "ZCode task failed"}${usage.error_code ? ` (${usage.error_code})` : ""}`;
+  const approvedCalls = new Set();
   return waitFor(async () => {
     const state = readSession(sessionId);
     if (!state) return null;
@@ -479,6 +546,22 @@ async function watchDesktopSession({ sessionId, signal }) {
     if (USAGE_FAILED.has(usageStatus)) {
       return { status: "failed", sessionId, output: state.output, diagnostics: usageDiagnostics(state.usage), usage: state.usage };
     }
+    if (state.pendingQuestionCallId) {
+      onAwaitingUser?.("question");
+      return null;
+    }
+    if (state.pendingPlanCallId) {
+      if (!approvedCalls.has(state.pendingPlanCallId)) {
+        approvedCalls.add(state.pendingPlanCallId);
+        onLog?.(`watch ${sessionId}: pending plan approval ${state.pendingPlanCallId}, auto-approving`);
+        void approvePendingPlan(sessionId, fallbackWorkspace, onLog).catch((error) => {
+          onLog?.(`watch ${sessionId}: auto-approve crashed: ${error.message}`);
+        });
+      }
+      onAwaitingUser?.("plan-approval");
+      return null;
+    }
+    onAwaitingUser?.(null);
     if (state.completed || USAGE_SUCCESS.has(usageStatus)) {
       return { status: "completed", sessionId, output: state.output, diagnostics: "", usage: state.usage };
     }
@@ -502,6 +585,7 @@ async function cancelZCodeSession({ sessionId, workspace } = {}) {
 module.exports = {
   ZCODE_DB,
   ZCODE_EXE,
+  approvePendingPlan,
   cancelZCodeSession,
   captchaVisible,
   partCount,

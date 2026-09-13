@@ -56,6 +56,15 @@ Two behaviors verified against ZCode Desktop:
 
 Note: the delegated subagent inside ZCode always starts fresh by design; the ZCode main agent's summary is what carries across turns.
 
+## Unattended-run handling
+
+Two ZCode UI states would otherwise block forever with nobody at the machine:
+
+- **Plan approval** (`ExitPlanMode` card "请审阅此实施计划"). ZCode latches the interactive task's permission mode at task creation (default `plan`), so the main agent eventually presents an implementation plan and waits for a human. The bridge detects the pending approval in the session store and clicks `批准` automatically - the yolo semantic the bridge promises.
+- **Agent questions** (`AskUserQuestion`). These cannot be auto-answered. The job reports `needs_user_action` with a blocker telling the operator to answer in the ZCode window; it resumes automatically once answered.
+
+To keep Codex-side quota burn low while jobs run for many minutes, `get_status` supports a server-side long poll: pass `wait_ms` (capped at 45000; the agent instructions use 40000). The call returns as soon as the job's observable state changes instead of immediately, so a polling wrapper costs one tool round-trip per status change rather than one per second.
+
 ## Cancellation and captcha
 
 - `cancel_task` is safe at any phase. Before send, the job aborts immediately. After send, the broker first hunts down the session id and stops the ZCode session through the UI (so no orphan session keeps burning tokens), then finalizes the job as `cancelled`.
@@ -82,7 +91,7 @@ Environment overrides:
 - `ZCODE_CDP_HOST` (default `127.0.0.1`)
 - `ZCODE_CDP_PORT` (default `19223`, ZCode Desktop's CDP endpoint)
 - `ZCODE_BROKER_PORT` (default `19224`, bridge-internal loopback port)
-- `ZCODE_MAX_PARALLEL_JOBS` (default `3`, semaphore for concurrently watching sessions)
+- `ZCODE_MAX_PARALLEL_JOBS` (default `2`, semaphore for concurrently watching sessions; the Coding Plan rejects a 3rd concurrent turn)
 - `ZCODE_BROKER_IDLE_MS` (default `600000`, broker exits after this much idle time)
 - `ZCODE_TASK_TIMEOUT_MS`
 - `ZCODE_CANCEL_HUNT_TIMEOUT_MS` (default `60000`, bound for finding a session while cancelling after send)

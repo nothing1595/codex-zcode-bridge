@@ -37,7 +37,7 @@ function request(method, params = {}) {
     pending.set(id, { resolve, reject });
     setTimeout(() => {
       if (pending.delete(id)) reject(new Error(`timeout waiting for ${method}`));
-    }, 30_000).unref();
+    }, 60_000).unref();
   });
 }
 
@@ -51,10 +51,9 @@ async function main() {
   const jobId = JSON.parse(started.content[0].text).job_id;
   let state;
   do {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    const status = await request("tools/call", { name: "get_status", arguments: { job_id: jobId } });
+    const status = await request("tools/call", { name: "get_status", arguments: { job_id: jobId, wait_ms: 30_000 } });
     state = JSON.parse(status.content[0].text);
-  } while (["queued", "running", "needs_user_action"].includes(state.status));
+  } while (["queued", "running", "needs_user_action", "submitting", "submitted"].includes(state.status));
   process.stdout.write(`${JSON.stringify(state, null, 2)}\n`);
   child.kill();
   process.exitCode = state.status === "completed" ? 0 : 1;

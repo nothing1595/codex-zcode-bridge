@@ -115,8 +115,16 @@ const tools = [
   },
   {
     name: "get_status",
-    description: "Get status and accumulated output for a ZCode task. Statuses: queued, running, needs_user_action, cancelling, completed, failed, cancelled.",
-    inputSchema: { type: "object", properties: { job_id: { type: "string" } }, required: ["job_id"], additionalProperties: false },
+    description: "Get status and accumulated output for a ZCode task. Statuses: queued, running, needs_user_action, cancelling, completed, failed, cancelled. Pass wait_ms (e.g. 40000) for a server-side long poll: the call returns as soon as the status changes instead of immediately - use it to avoid burning quota on busy-polling.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string" },
+        wait_ms: { type: "number", description: "Hold the response until the status changes, up to 45000 ms. Recommended: 40000." },
+      },
+      required: ["job_id"],
+      additionalProperties: false,
+    },
   },
   {
     name: "cancel_task",

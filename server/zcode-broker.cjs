@@ -48,6 +48,17 @@ let activeSlots = 0;
 const slotWaiters = [];
 let lastActivity = Date.now();
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Lightweight append-only event log so unattended-run behavior (auto-approve,
+// captcha, job transitions) can be diagnosed after the fact.
+const BROKER_LOG = process.env.ZCODE_BROKER_LOG || path.join(os.tmpdir(), "zcode-broker.log");
+function logEvent(message) {
+  const line = `${new Date().toISOString()} ${message}\n`;
+  process.stderr.write(line);
+  try { fs.appendFileSync(BROKER_LOG, line); } catch { /* log is best-effort */ }
+}
+
 function safeTail(value) {
   return value.length <= MAX_OUTPUT_CHARS ? value : `[output truncated]\n${value.slice(-MAX_OUTPUT_CHARS)}`;
 }
@@ -208,11 +219,13 @@ function startJob(args) {
     usage: null,
     sent: false,
     cancelRequested: false,
+    awaitingUser: null,
     abortController: new AbortController(),
     slotHeld: false,
     child: null,
   };
   jobs.set(jobId, job);
+  logEvent(`job ${jobId} created (${transport}, ${model}, workspace=${workspace})`);
   if (transport === "cli") void executeCliJob(job);
   else void executeDesktopJob(job);
   return publicJob(job, false);
@@ -244,7 +257,16 @@ async function executeDesktopJob(job) {
     });
     job.sessionId = submitted.sessionId;
     job.status = "running";
-    const final = await watchDesktopSession({ sessionId: submitted.sessionId, signal: job.abortController.signal });
+    const final = await watchDesktopSession({
+      sessionId: submitted.sessionId,
+      signal: job.abortController.signal,
+      fallbackWorkspace: job.workspace,
+      onAwaitingUser: (kind) => {
+        if (job.awaitingUser !== kind) logEvent(`job ${job.jobId} awaiting=${kind || "none"}`);
+        job.awaitingUser = kind;
+      },
+      onLog: logEvent,
+    });
     job.status = final.status;
     job.stdout = safeTail(final.output || "");
     job.stderr = safeTail(final.diagnostics || "");
@@ -256,6 +278,7 @@ async function executeDesktopJob(job) {
     job.exitCode = 1;
   } finally {
     job.completedAt = new Date().toISOString();
+    logEvent(`job ${job.jobId} settled: ${job.status}`);
     if (job.sessionId) activeSessionIds.delete(job.sessionId);
     if (job.resumeSessionId) activeSessionIds.delete(job.resumeSessionId);
     releaseSlot(job);
@@ -347,6 +370,7 @@ function publicJob(job, includeOutput = true) {
   const terminal = TERMINAL.has(job.status);
   let status = job.status;
   if (!terminal && captchaActive && job.transport === "desktop") status = "needs_user_action";
+  else if (!terminal && job.awaitingUser === "question" && job.transport === "desktop") status = "needs_user_action";
   else if (job.status === "submitting" || job.status === "submitted") status = "running";
   const result = {
     job_id: job.jobId,
@@ -365,8 +389,10 @@ function publicJob(job, includeOutput = true) {
     if (/captcha verify failed/i.test(job.stderr)) {
       result.blocker = "ZCode Coding Plan rejected the standalone CLI because desktop captcha runtime headers are unavailable.";
     }
-    if (status === "needs_user_action") {
+    if (status === "needs_user_action" && captchaActive) {
       result.blocker = "Complete the captcha in the visible ZCode Desktop window. Captcha pauses the whole desktop app; every active bridge job resumes automatically once it is resolved.";
+    } else if (status === "needs_user_action" && job.awaitingUser === "question") {
+      result.blocker = "The ZCode agent asked a question (AskUserQuestion) and is waiting for a human answer in the ZCode window. Answer it there; this job resumes automatically. Plan approvals are auto-approved and never need a human.";
     }
   }
   return result;
@@ -375,7 +401,7 @@ function publicJob(job, includeOutput = true) {
 // ---------------------------------------------------------------------------
 // Loopback TCP service (line-delimited JSON requests/responses)
 
-function dispatch(method, params) {
+async function dispatch(method, params) {
   switch (method) {
     case "health":
       return {
@@ -392,6 +418,18 @@ function dispatch(method, params) {
     case "get_status": {
       const job = jobs.get(params.job_id);
       if (!job) throw new Error(`unknown job_id: ${params.job_id}`);
+      // Optional server-side long poll: hold the response until the job's
+      // observable state changes or wait_ms elapses, so MCP clients do not
+      // burn their own quota busy-polling.
+      const waitMs = Math.min(Number(params.wait_ms) || 0, 45_000);
+      if (waitMs > 0 && !TERMINAL.has(job.status)) {
+        const fingerprint = () => `${job.status}|${job.sessionId}|${job.stdout.length}|${job.stderr.length}|${job.awaitingUser || ""}|${captchaActive}`;
+        const initial = fingerprint();
+        const deadline = Date.now() + waitMs;
+        while (Date.now() < deadline && !TERMINAL.has(job.status) && fingerprint() === initial) {
+          await sleep(400);
+        }
+      }
       return publicJob(job);
     }
     case "cancel_task":
