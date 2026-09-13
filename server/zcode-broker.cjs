@@ -220,6 +220,7 @@ function startJob(args) {
     sent: false,
     cancelRequested: false,
     awaitingUser: null,
+    progress: null,
     abortController: new AbortController(),
     slotHeld: false,
     child: null,
@@ -265,6 +266,7 @@ async function executeDesktopJob(job) {
         if (job.awaitingUser !== kind) logEvent(`job ${job.jobId} awaiting=${kind || "none"}`);
         job.awaitingUser = kind;
       },
+      onProgress: (progress) => { job.progress = progress; },
       onLog: logEvent,
     });
     job.status = final.status;
@@ -371,6 +373,7 @@ function publicJob(job, includeOutput = true) {
   let status = job.status;
   if (!terminal && captchaActive && job.transport === "desktop") status = "needs_user_action";
   else if (!terminal && job.awaitingUser === "question" && job.transport === "desktop") status = "needs_user_action";
+  else if (!terminal && job.awaitingUser === "plan-approval" && job.transport === "desktop") status = "needs_user_action";
   else if (job.status === "submitting" || job.status === "submitted") status = "running";
   const result = {
     job_id: job.jobId,
@@ -393,6 +396,19 @@ function publicJob(job, includeOutput = true) {
       result.blocker = "Complete the captcha in the visible ZCode Desktop window. Captcha pauses the whole desktop app; every active bridge job resumes automatically once it is resolved.";
     } else if (status === "needs_user_action" && job.awaitingUser === "question") {
       result.blocker = "The ZCode agent asked a question (AskUserQuestion) and is waiting for a human answer in the ZCode window. Answer it there; this job resumes automatically. Plan approvals are auto-approved and never need a human.";
+    } else if (status === "needs_user_action" && job.awaitingUser === "plan-approval") {
+      result.blocker = "The ZCode agent presented an implementation plan; the bridge is auto-approving it. No action needed unless this persists - check the ZCode window if it does.";
+    }
+    // Liveness signal so polling clients can tell a healthy long run (recent
+    // store activity, growing parts) from a wedged one without touching the
+    // workspace.
+    if (job.progress) {
+      result.progress = {
+        last_activity_age_s: Math.max(0, Math.round((Date.now() - Number(job.progress.lastActivityMs || 0)) / 1000)),
+        parts: job.progress.partsCount,
+        subagents: job.progress.subagents,
+        active_tool: job.progress.activeTool,
+      };
     }
   }
   return result;
@@ -420,7 +436,10 @@ async function dispatch(method, params) {
       if (!job) throw new Error(`unknown job_id: ${params.job_id}`);
       // Optional server-side long poll: hold the response until the job's
       // observable state changes or wait_ms elapses, so MCP clients do not
-      // burn their own quota busy-polling.
+      // burn their own quota busy-polling. Progress is deliberately excluded
+      // from the fingerprint: it changes on every poll cycle and would wake
+      // the client every ~750ms, recreating the busy-poll problem. Clients
+      // receive the latest progress snapshot whenever the poll returns.
       const waitMs = Math.min(Number(params.wait_ms) || 0, 45_000);
       if (waitMs > 0 && !TERMINAL.has(job.status)) {
         const fingerprint = () => `${job.status}|${job.sessionId}|${job.stdout.length}|${job.stderr.length}|${job.awaitingUser || ""}|${captchaActive}`;

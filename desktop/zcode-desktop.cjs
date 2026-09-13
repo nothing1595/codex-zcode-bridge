@@ -12,7 +12,10 @@ const ZCODE_EXE = process.env.ZCODE_EXE || "E:\\ZCode\\ZCode.exe";
 const ZCODE_DB = process.env.ZCODE_DB || path.join(os.homedir(), ".zcode", "cli", "db", "db.sqlite");
 const POLL_MS = Number(process.env.ZCODE_POLL_MS || 750);
 const START_TIMEOUT_MS = Number(process.env.ZCODE_START_TIMEOUT_MS || 30_000);
-const TASK_TIMEOUT_MS = Number(process.env.ZCODE_TASK_TIMEOUT_MS || 30 * 60_000);
+// Hard cap only: a session whose store keeps changing is alive at any age.
+// The real stall detector is TASK_IDLE_TIMEOUT_MS below.
+const TASK_TIMEOUT_MS = Number(process.env.ZCODE_TASK_TIMEOUT_MS || 4 * 60 * 60_000);
+const TASK_IDLE_TIMEOUT_MS = Number(process.env.ZCODE_TASK_IDLE_TIMEOUT_MS || 10 * 60_000);
 // Upper bound for hunting the session id after Send was clicked while a cancel came in.
 const CANCEL_HUNT_TIMEOUT_MS = Number(process.env.ZCODE_CANCEL_HUNT_TIMEOUT_MS || 60_000);
 
@@ -233,7 +236,27 @@ function readSession(sessionId) {
     `).all(sessionId, sessionId);
     const planCall = blocking.find((r) => r.tool === "ExitPlanMode") || null;
     const questionCall = blocking.find((r) => r.tool === "AskUserQuestion") || null;
-    return { session, messages, parts, usage, output, completed, pendingPlanCallId: planCall?.callId || null, pendingQuestionCallId: questionCall?.callId || null };
+    // Live progress across the parent session and its subagent children, so
+    // polling clients can tell a healthy long run (store keeps changing) from
+    // a wedged one without touching the workspace.
+    const scope = "(SELECT id FROM session WHERE id = ? OR parent_id = ?)";
+    const progressRow = db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM session WHERE parent_id = ?) AS subagents,
+        (SELECT COUNT(*) FROM part WHERE session_id IN ${scope}) AS parts,
+        (SELECT COALESCE(MAX(time_updated), 0) FROM part WHERE session_id IN ${scope}) AS last_activity,
+        (SELECT json_extract(data, '$.tool') FROM part WHERE session_id IN ${scope}
+          AND json_extract(data, '$.type') = 'tool'
+          AND COALESCE(json_extract(data, '$.state.status'), '') = 'running'
+          ORDER BY time_created DESC LIMIT 1) AS active_tool
+    `).get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId);
+    const progress = {
+      lastActivityMs: Number(progressRow.last_activity) || 0,
+      partsCount: Number(progressRow.parts) || 0,
+      subagents: Number(progressRow.subagents) || 0,
+      activeTool: progressRow.active_tool || null,
+    };
+    return { session, messages, parts, usage, output, completed, progress, pendingPlanCallId: planCall?.callId || null, pendingQuestionCallId: questionCall?.callId || null };
   } finally { db.close(); }
 }
 
@@ -460,7 +483,9 @@ async function submitDesktopTask({ workspace, prompt, model, mode = "yolo", resu
       if (cancelRequested()) throw cancelledError();
       await sendPrompt(connection);
       onSent?.();
-      const huntBudget = Math.max(START_TIMEOUT_MS, TASK_TIMEOUT_MS);
+      // Session rows normally appear within a second of Send; this hunt is
+      // decoupled from TASK_TIMEOUT_MS (which is now a multi-hour hard cap).
+      const huntBudget = Math.max(START_TIMEOUT_MS, 60_000);
       let sessionDeadline = Date.now() + huntBudget;
       let sessionRow = null;
       while (!sessionRow && Date.now() < sessionDeadline) {
@@ -529,46 +554,73 @@ async function approvePendingPlan(sessionId, fallbackWorkspace, onLog) {
 }
 
 // Phase 2: per-session completion watch. Pure read-only SQLite polling; any
-// number of these run in parallel. Pending plan approvals are auto-approved
-// (that is the yolo semantic the bridge promises); pending agent questions
-// cannot be auto-answered and are reported through onAwaitingUser so the
-// caller can surface needs_user_action.
-async function watchDesktopSession({ sessionId, signal, fallbackWorkspace, onAwaitingUser, onLog }) {
+// number of these run in parallel. Timeout is liveness-based: a session whose
+// store keeps changing is alive at any age (healthy 30+ minute implementations
+// must not be failed by a wall clock); only genuine silence beyond
+// TASK_IDLE_TIMEOUT_MS counts as a stall, with TASK_TIMEOUT_MS as a hard cap.
+// Pending plan approvals are auto-approved (the yolo semantic the bridge
+// promises); pending agent questions cannot be auto-answered and are reported
+// through onAwaitingUser so the caller can surface needs_user_action. A job
+// waiting on a human answer is deliberately exempt from both clocks.
+async function watchDesktopSession({ sessionId, signal, fallbackWorkspace, onAwaitingUser, onProgress, onLog }) {
   const usageDiagnostics = (usage) => `${usage.error_type || "ZCode task failed"}${usage.error_code ? ` (${usage.error_code})` : ""}`;
   const approvedCalls = new Set();
-  return waitFor(async () => {
-    const state = readSession(sessionId);
-    if (!state) return null;
-    const usageStatus = state.usage?.status;
-    if (USAGE_CANCELLED.has(usageStatus)) {
-      return { status: "cancelled", sessionId, output: state.output, diagnostics: "", usage: state.usage };
+  const hardDeadline = Date.now() + TASK_TIMEOUT_MS;
+  let consecutiveErrors = 0;
+  for (;;) {
+    throwIfAborted(signal);
+    if (Date.now() >= hardDeadline) {
+      throw new Error(`Timed out (hard cap ${Math.round(TASK_TIMEOUT_MS / 60_000)} min) waiting for ZCode session ${sessionId} completion`);
     }
-    if (USAGE_FAILED.has(usageStatus)) {
-      return { status: "failed", sessionId, output: state.output, diagnostics: usageDiagnostics(state.usage), usage: state.usage };
+    let state = null;
+    try {
+      state = readSession(sessionId);
+      consecutiveErrors = 0;
+    } catch (error) {
+      // A poll that keeps failing (broken query, missing table) must fail the
+      // job instead of silently draining the whole timeout budget.
+      consecutiveErrors += 1;
+      if (consecutiveErrors >= 20) throw new Error(`poll for ZCode session ${sessionId} kept failing: ${error.message}`);
     }
-    if (state.pendingQuestionCallId) {
-      onAwaitingUser?.("question");
-      return null;
-    }
-    if (state.pendingPlanCallId) {
-      if (!approvedCalls.has(state.pendingPlanCallId)) {
-        approvedCalls.add(state.pendingPlanCallId);
-        onLog?.(`watch ${sessionId}: pending plan approval ${state.pendingPlanCallId}, auto-approving`);
-        void approvePendingPlan(sessionId, fallbackWorkspace, onLog).catch((error) => {
-          onLog?.(`watch ${sessionId}: auto-approve crashed: ${error.message}`);
-        });
+    if (state) {
+      onProgress?.(state.progress);
+      const usageStatus = state.usage?.status;
+      if (USAGE_CANCELLED.has(usageStatus)) {
+        onAwaitingUser?.(null);
+        return { status: "cancelled", sessionId, output: state.output, diagnostics: "", usage: state.usage };
       }
-      onAwaitingUser?.("plan-approval");
-      return null;
+      if (USAGE_FAILED.has(usageStatus)) {
+        onAwaitingUser?.(null);
+        return { status: "failed", sessionId, output: state.output, diagnostics: usageDiagnostics(state.usage), usage: state.usage };
+      }
+      if (state.pendingQuestionCallId) {
+        onAwaitingUser?.("question");
+        await sleep(POLL_MS);
+        continue;
+      }
+      if (state.pendingPlanCallId) {
+        if (!approvedCalls.has(state.pendingPlanCallId)) {
+          approvedCalls.add(state.pendingPlanCallId);
+          onLog?.(`watch ${sessionId}: pending plan approval ${state.pendingPlanCallId}, auto-approving`);
+          void approvePendingPlan(sessionId, fallbackWorkspace, onLog).catch((error) => {
+            onLog?.(`watch ${sessionId}: auto-approve crashed: ${error.message}`);
+          });
+        }
+        onAwaitingUser?.("plan-approval");
+        await sleep(POLL_MS);
+        continue;
+      }
+      onAwaitingUser?.(null);
+      if (state.completed || USAGE_SUCCESS.has(usageStatus)) {
+        return { status: "completed", sessionId, output: state.output, diagnostics: "", usage: state.usage };
+      }
+      const lastActivity = Number(state.progress?.lastActivityMs || 0);
+      if (lastActivity && Date.now() - lastActivity > TASK_IDLE_TIMEOUT_MS) {
+        throw new Error(`ZCode session ${sessionId} stalled: no activity in the session store for ${Math.round((Date.now() - lastActivity) / 1000)}s`);
+      }
     }
-    onAwaitingUser?.(null);
-    if (state.completed || USAGE_SUCCESS.has(usageStatus)) {
-      return { status: "completed", sessionId, output: state.output, diagnostics: "", usage: state.usage };
-    }
-    // usage row missing -> judge by final assistant message; unknown future
-    // usage status -> keep waiting rather than misreporting a live turn.
-    return null;
-  }, TASK_TIMEOUT_MS, `ZCode session ${sessionId} completion`, signal);
+    await sleep(POLL_MS);
+  }
 }
 
 // Cancel a running session from outside a submission. Takes the window lock

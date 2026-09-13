@@ -65,6 +65,17 @@ Two ZCode UI states would otherwise block forever with nobody at the machine:
 
 To keep Codex-side quota burn low while jobs run for many minutes, `get_status` supports a server-side long poll: pass `wait_ms` (capped at 45000; the agent instructions use 40000). The call returns as soon as the job's observable state changes instead of immediately, so a polling wrapper costs one tool round-trip per status change rather than one per second.
 
+## Progress and liveness
+
+`get_status` includes a `progress` object for desktop jobs: `last_activity_age_s` (seconds since the watched session or any of its subagents last wrote to ZCode's store), `parts`, `subagents`, and `active_tool`. A `running` job with recent activity is healthy regardless of output emptiness or missing files - the agents' instructions tell them to report this factually instead of declaring the job stuck.
+
+Timeouts are liveness-based, not wall-clock:
+
+- `ZCODE_TASK_IDLE_TIMEOUT_MS` (default `600000`): a job fails as `stalled` only after this much total silence in the session store. A healthy 40-minute implementation that keeps writing parts never trips it.
+- `ZCODE_TASK_TIMEOUT_MS` (default `14400000`, 4 hours): hard cap only. Waiting on a human answer (`needs_user_action` from a question) does not consume either clock.
+
+This matters because long implementation jobs (30+ minutes of real work) previously hit a 30-minute wall-clock timeout and surfaced as `failed` while ZCode was still working - which downstream orchestration then (correctly, by its own rules) treated as a confirmed failure and restarted.
+
 ## Cancellation and captcha
 
 - `cancel_task` is safe at any phase. Before send, the job aborts immediately. After send, the broker first hunts down the session id and stops the ZCode session through the UI (so no orphan session keeps burning tokens), then finalizes the job as `cancelled`.
@@ -93,7 +104,8 @@ Environment overrides:
 - `ZCODE_BROKER_PORT` (default `19224`, bridge-internal loopback port)
 - `ZCODE_MAX_PARALLEL_JOBS` (default `2`, semaphore for concurrently watching sessions; the Coding Plan rejects a 3rd concurrent turn)
 - `ZCODE_BROKER_IDLE_MS` (default `600000`, broker exits after this much idle time)
-- `ZCODE_TASK_TIMEOUT_MS`
+- `ZCODE_TASK_TIMEOUT_MS` (default `14400000`, hard cap for a whole job)
+- `ZCODE_TASK_IDLE_TIMEOUT_MS` (default `600000`, stall detection: total store silence before a running job is failed)
 - `ZCODE_CANCEL_HUNT_TIMEOUT_MS` (default `60000`, bound for finding a session while cancelling after send)
 - `ZCODE_TRANSPORT` (`desktop` by default; `cli` retains the legacy diagnostic route)
 
