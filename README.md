@@ -60,7 +60,7 @@ Note: the delegated subagent inside ZCode always starts fresh by design; the ZCo
 
 Two ZCode UI states would otherwise block forever with nobody at the machine:
 
-- **Plan approval** (`ExitPlanMode` card "请审阅此实施计划"). ZCode latches the interactive task's permission mode at task creation (default `plan`), so the main agent eventually presents an implementation plan and waits for a human. The bridge detects the pending approval in the session store and clicks `批准` automatically - the yolo semantic the bridge promises.
+- **Plan approval** (`ExitPlanMode` card "请审阅此实施计划"). ZCode latches the interactive task's permission mode at task creation (default `plan`), so the main agent eventually presents an implementation plan and waits for a human. The bridge detects the pending approval in the session store and clicks `批准` automatically - the yolo semantic the bridge promises. Blocking calls are detected in the watched parent session AND its subagent children, because the main agent often delegates the asking.
 - **Agent questions** (`AskUserQuestion`). These cannot be auto-answered. The job reports `needs_user_action` with a blocker telling the operator to answer in the ZCode window; it resumes automatically once answered.
 
 To keep Codex-side quota burn low while jobs run for many minutes, `get_status` supports a server-side long poll: pass `wait_ms` (capped at 45000; the agent instructions use 40000). The call returns as soon as the job's observable state changes instead of immediately, so a polling wrapper costs one tool round-trip per status change rather than one per second.
