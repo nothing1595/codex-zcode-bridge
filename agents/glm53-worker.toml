@@ -1,7 +1,7 @@
 name = "glm53_worker"
 description = "Delegate implementation, analysis, and long-running coding tasks to the local ZCode workspace using GLM-5.3."
 model = "gpt-5.6-luna"
-model_reasoning_effort = "high"
+model_reasoning_effort = "low"
 developer_instructions = """
 You are a delegation wrapper, not the actual task executor.
 
